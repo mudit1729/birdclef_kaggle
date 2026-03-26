@@ -213,7 +213,7 @@ def run_train() -> Path:
         "--transformer-pooling",
         "attention",
         "--min-rating",
-        "2",
+        "0",
         "--validation-fraction",
         "0.1",
         "--max-samples",
@@ -232,7 +232,7 @@ def run_train() -> Path:
         "0",
         "--drop-path-rate",
         "0.1",
-        "--no-pretrained",
+        "--pretrained",
     ]
     return train_main()
 

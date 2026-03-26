@@ -355,7 +355,7 @@ def run_train() -> Path:
         "--transformer-pooling",
         "attention",
         "--min-rating",
-        "2",
+        "0",
         "--validation-fraction",
         "0.1",
         "--max-samples",
@@ -374,7 +374,7 @@ def run_train() -> Path:
         "{preset.time_mask_param}",
         "--drop-path-rate",
         "{preset.drop_path_rate}",
-        "--no-pretrained",
+        "--pretrained",
     ]
     return train_main()
 
