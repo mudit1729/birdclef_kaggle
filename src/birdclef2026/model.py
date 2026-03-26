@@ -120,6 +120,35 @@ class AttentionPooling(nn.Module):
         return pooled, weights
 
 
+class FramewiseAttentionPooling(nn.Module):
+    def __init__(self, dim: int, num_classes: int, dropout: float) -> None:
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, num_classes),
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        framewise_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = torch.softmax(self.attention(tokens), dim=1)
+        pooled = (framewise_logits * weights).sum(dim=1)
+        return pooled, weights
+
+
+def combine_primary_secondary_probabilities(
+    primary_logits: torch.Tensor,
+    secondary_logits: torch.Tensor,
+) -> torch.Tensor:
+    primary_probs = torch.softmax(primary_logits, dim=-1)
+    secondary_probs = torch.sigmoid(secondary_logits)
+    return 1.0 - (1.0 - primary_probs) * (1.0 - secondary_probs)
+
+
 def to_channel_first(feature_map: torch.Tensor) -> torch.Tensor:
     if feature_map.ndim != 4:
         raise ValueError(f"Expected a 4D feature map, got shape {tuple(feature_map.shape)}")
@@ -160,18 +189,45 @@ class TokenSemanticLayer(nn.Module):
         return class_queries, attention_weights
 
 
-class BirdClefBackboneClassifier(nn.Module):
-    def __init__(self, num_classes: int, backbone: str, pretrained: bool) -> None:
+class BirdClefSingleHeadClassifier(nn.Module):
+    def __init__(
+        self, num_classes: int, backbone: str, pretrained: bool, drop_path_rate: float = 0.0
+    ) -> None:
         super().__init__()
         self.backbone = timm.create_model(
             backbone,
             pretrained=pretrained,
             in_chans=1,
             num_classes=num_classes,
+            drop_path_rate=drop_path_rate,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone(x)
+
+
+class BirdClefDualHeadClassifier(nn.Module):
+    def __init__(
+        self, num_classes: int, backbone: str, pretrained: bool, drop_path_rate: float = 0.0
+    ) -> None:
+        super().__init__()
+        self.backbone = timm.create_model(
+            backbone,
+            pretrained=pretrained,
+            in_chans=1,
+            num_classes=0,
+            global_pool="avg",
+            drop_path_rate=drop_path_rate,
+        )
+        self.primary_head = nn.Linear(self.backbone.num_features, num_classes)
+        self.secondary_head = nn.Linear(self.backbone.num_features, num_classes)
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        features = self.backbone(x)
+        return {
+            "primary_logits": self.primary_head(features),
+            "secondary_logits": self.secondary_head(features),
+        }
 
 
 class BirdClefTransformerSEDModel(nn.Module):
@@ -184,6 +240,8 @@ class BirdClefTransformerSEDModel(nn.Module):
         transformer_heads: int,
         transformer_layers: int,
         dropout: float,
+        transformer_pooling: str,
+        drop_path_rate: float = 0.0,
     ) -> None:
         super().__init__()
         self.backbone = timm.create_model(
@@ -192,6 +250,7 @@ class BirdClefTransformerSEDModel(nn.Module):
             in_chans=1,
             features_only=True,
             out_indices=(-1,),
+            drop_path_rate=drop_path_rate,
         )
         feature_channels = self.backbone.feature_info.channels()[-1]
         self.token_projection = nn.Linear(feature_channels, transformer_dim)
@@ -203,9 +262,21 @@ class BirdClefTransformerSEDModel(nn.Module):
             )
             for _ in range(transformer_layers)
         )
+        self.transformer_pooling = transformer_pooling
         self.output_norm = nn.LayerNorm(transformer_dim)
-        self.attention_pool = AttentionPooling(transformer_dim, dropout=dropout)
-        self.classifier = nn.Linear(transformer_dim, num_classes)
+        if transformer_pooling == "clip_attention":
+            self.attention_pool = AttentionPooling(transformer_dim, dropout=dropout)
+            self.classifier = nn.Linear(transformer_dim, num_classes)
+        else:
+            self.frame_classifier = nn.Linear(transformer_dim, num_classes)
+            if transformer_pooling == "attention":
+                self.frame_attention_pool = FramewiseAttentionPooling(
+                    dim=transformer_dim,
+                    num_classes=num_classes,
+                    dropout=dropout,
+                )
+            elif transformer_pooling not in {"mean", "max"}:
+                raise ValueError(f"Unknown transformer pooling mode: {transformer_pooling}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feature_map = to_channel_first(self.backbone(x)[-1])
@@ -215,8 +286,16 @@ class BirdClefTransformerSEDModel(nn.Module):
         for block in self.sequence_encoder:
             tokens = block(tokens)
         tokens = self.output_norm(tokens)
-        pooled, _ = self.attention_pool(tokens)
-        return self.classifier(pooled)
+        if self.transformer_pooling == "clip_attention":
+            pooled, _ = self.attention_pool(tokens)
+            return self.classifier(pooled)
+        framewise_logits = self.frame_classifier(tokens)
+        if self.transformer_pooling == "mean":
+            return framewise_logits.mean(dim=1)
+        if self.transformer_pooling == "max":
+            return framewise_logits.max(dim=1).values
+        pooled, _ = self.frame_attention_pool(tokens, framewise_logits)
+        return pooled
 
 
 class BirdClefHTSATModel(nn.Module):
@@ -229,6 +308,7 @@ class BirdClefHTSATModel(nn.Module):
         transformer_heads: int,
         transformer_layers: int,
         dropout: float,
+        drop_path_rate: float = 0.0,
     ) -> None:
         super().__init__()
         if transformer_layers < 1:
@@ -239,6 +319,7 @@ class BirdClefHTSATModel(nn.Module):
             in_chans=1,
             features_only=True,
             out_indices=(-1,),
+            drop_path_rate=drop_path_rate,
         )
         feature_channels = self.backbone.feature_info.channels()[-1]
         self.token_projection = nn.Linear(feature_channels, transformer_dim)
@@ -272,17 +353,30 @@ def build_model(
     architecture: str,
     backbone: str,
     pretrained: bool,
+    classifier_head_mode: str = "single",
     transformer_dim: int = 256,
     transformer_heads: int = 8,
     transformer_layers: int = 2,
     dropout: float = 0.1,
+    transformer_pooling: str = "clip_attention",
+    drop_path_rate: float = 0.0,
 ) -> nn.Module:
     if architecture == "efficientnet_classifier":
-        return BirdClefBackboneClassifier(
-            num_classes=num_classes,
-            backbone=backbone,
-            pretrained=pretrained,
-        )
+        if classifier_head_mode == "dual":
+            return BirdClefDualHeadClassifier(
+                num_classes=num_classes,
+                backbone=backbone,
+                pretrained=pretrained,
+                drop_path_rate=drop_path_rate,
+            )
+        if classifier_head_mode == "single":
+            return BirdClefSingleHeadClassifier(
+                num_classes=num_classes,
+                backbone=backbone,
+                pretrained=pretrained,
+                drop_path_rate=drop_path_rate,
+            )
+        raise ValueError(f"Unknown classifier head mode: {classifier_head_mode}")
     if architecture == "efficientnet_transformer_sed":
         return BirdClefTransformerSEDModel(
             num_classes=num_classes,
@@ -292,6 +386,8 @@ def build_model(
             transformer_heads=transformer_heads,
             transformer_layers=transformer_layers,
             dropout=dropout,
+            transformer_pooling=transformer_pooling,
+            drop_path_rate=drop_path_rate,
         )
     if architecture == "htsat_token_semantic":
         return BirdClefHTSATModel(
@@ -302,5 +398,6 @@ def build_model(
             transformer_heads=transformer_heads,
             transformer_layers=transformer_layers,
             dropout=dropout,
+            drop_path_rate=drop_path_rate,
         )
     raise ValueError(f"Unknown architecture: {architecture}")

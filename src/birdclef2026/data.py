@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import random
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -11,7 +12,13 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from birdclef2026.audio import crop_or_pad, load_audio, waveform_to_image
+from birdclef2026.audio import (
+    crop_or_pad,
+    load_audio,
+    random_filtering,
+    spec_augment,
+    waveform_to_image,
+)
 from birdclef2026.config import CompetitionLayout, infer_layout
 
 
@@ -150,7 +157,7 @@ def split_examples(
     return train_examples, valid_examples
 
 
-class BirdClefDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
+class BirdClefDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
     def __init__(
         self,
         examples: Iterable[Example],
@@ -165,6 +172,10 @@ class BirdClefDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         fmin: int,
         fmax: int,
         random_crop: bool,
+        mixup_alpha: float = 0.0,
+        random_filter_prob: float = 0.0,
+        freq_mask_param: int = 0,
+        time_mask_param: int = 0,
     ) -> None:
         self.examples = list(examples)
         self.label_names = label_names
@@ -178,12 +189,34 @@ class BirdClefDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         self.fmin = fmin
         self.fmax = fmax
         self.random_crop = random_crop
+        self.mixup_alpha = mixup_alpha
+        self.random_filter_prob = random_filter_prob
+        self.freq_mask_param = freq_mask_param
+        self.time_mask_param = time_mask_param
         self.label_to_index = {label: index for index, label in enumerate(label_names)}
+
+    def _build_targets(
+        self, example: Example
+    ) -> dict[str, torch.Tensor]:
+        combined_target = torch.zeros(len(self.label_names), dtype=torch.float32)
+        for label in example.labels:
+            combined_target[self.label_to_index[label]] = 1.0
+        secondary_target = torch.zeros(len(self.label_names), dtype=torch.float32)
+        for label in example.labels:
+            if label == example.primary_label:
+                continue
+            secondary_target[self.label_to_index[label]] = 1.0
+        primary_index = torch.tensor(self.label_to_index[example.primary_label], dtype=torch.long)
+        return {
+            "combined": combined_target,
+            "secondary": secondary_target,
+            "primary_index": primary_index,
+        }
 
     def __len__(self) -> int:
         return len(self.examples)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         example = self.examples[index]
         waveform = load_audio(example.audio_path, self.sample_rate)
         waveform = crop_or_pad(
@@ -192,6 +225,29 @@ class BirdClefDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
             clip_seconds=self.clip_seconds,
             random_crop=self.random_crop,
         )
+        targets = self._build_targets(example)
+
+        # Audio-domain MixUp: mix waveforms before mel extraction
+        if self.mixup_alpha > 0 and self.random_crop and random.random() < 0.5:
+            mix_idx = random.randint(0, len(self.examples) - 1)
+            mix_example = self.examples[mix_idx]
+            mix_waveform = load_audio(mix_example.audio_path, self.sample_rate)
+            mix_waveform = crop_or_pad(
+                waveform=mix_waveform,
+                sample_rate=self.sample_rate,
+                clip_seconds=self.clip_seconds,
+                random_crop=True,
+            )
+            lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+            waveform = (lam * waveform + (1.0 - lam) * mix_waveform).astype(np.float32)
+            mix_targets = self._build_targets(mix_example)
+            targets["combined"] = torch.maximum(targets["combined"], mix_targets["combined"])
+            targets["secondary"] = torch.maximum(targets["secondary"], mix_targets["secondary"])
+
+        # Random filtering augmentation (microphone variation simulation)
+        if self.random_filter_prob > 0 and self.random_crop:
+            waveform = random_filtering(waveform, self.sample_rate, self.random_filter_prob)
+
         image = waveform_to_image(
             waveform=waveform,
             sample_rate=self.sample_rate,
@@ -203,10 +259,16 @@ class BirdClefDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
             fmin=self.fmin,
             fmax=self.fmax,
         )
-        target = torch.zeros(len(self.label_names), dtype=torch.float32)
-        for label in example.labels:
-            target[self.label_to_index[label]] = 1.0
-        return image, target
+
+        # SpecAugment: frequency and time masking
+        if self.random_crop and (self.freq_mask_param > 0 or self.time_mask_param > 0):
+            image = spec_augment(
+                image,
+                freq_mask_param=self.freq_mask_param,
+                time_mask_param=self.time_mask_param,
+            )
+
+        return image, targets
 
 
 def build_submission_map(sample_submission: pd.DataFrame) -> dict[str, list[tuple[int, str]]]:

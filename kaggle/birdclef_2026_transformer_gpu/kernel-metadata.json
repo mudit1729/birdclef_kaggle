@@ -1,6 +1,6 @@
 {
-  "id": "muditjain1729/birdclef-2026-convnext-rope-transformer-gpu",
-  "title": "BirdCLEF 2026 ConvNeXt RoPE Transformer GPU",
+  "id": "muditjain1729/birdclef-2026-convnext-rope-xfmr-gpu-baseline",
+  "title": "BirdCLEF 2026 ConvNeXt RoPE Xfmr GPU v6",
   "code_file": "run.py",
   "language": "python",
   "kernel_type": "script",

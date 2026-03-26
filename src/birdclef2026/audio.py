@@ -32,6 +32,64 @@ def crop_or_pad(
     return padded
 
 
+def random_filtering(
+    waveform: np.ndarray,
+    sample_rate: int,
+    prob: float = 0.5,
+) -> np.ndarray:
+    """Apply random biquad peaking EQ filter to simulate microphone variation."""
+    if random.random() > prob:
+        return waveform
+    from scipy.signal import lfilter
+
+    center_freq = random.uniform(200, 8000)
+    gain_db = random.uniform(-6, 6)
+    q_factor = random.uniform(0.5, 2.0)
+    w0 = 2.0 * np.pi * center_freq / sample_rate
+    alpha = np.sin(w0) / (2.0 * q_factor)
+    a_lin = 10.0 ** (gain_db / 40.0)
+    b0 = 1.0 + alpha * a_lin
+    b1 = -2.0 * np.cos(w0)
+    b2 = 1.0 - alpha * a_lin
+    a0 = 1.0 + alpha / a_lin
+    a1 = -2.0 * np.cos(w0)
+    a2 = 1.0 - alpha / a_lin
+    b = np.array([b0 / a0, b1 / a0, b2 / a0])
+    a = np.array([1.0, a1 / a0, a2 / a0])
+    return lfilter(b, a, waveform).astype(np.float32)
+
+
+def spec_augment(
+    image: torch.Tensor,
+    freq_mask_param: int = 0,
+    time_mask_param: int = 0,
+    num_freq_masks: int = 1,
+    num_time_masks: int = 1,
+) -> torch.Tensor:
+    """Apply SpecAugment-style time and frequency masking to a spectrogram image.
+
+    Args:
+        image: (C, H, W) tensor where H=frequency, W=time.
+        freq_mask_param: Maximum width of frequency masks (0 to disable).
+        time_mask_param: Maximum width of time masks (0 to disable).
+    """
+    if freq_mask_param <= 0 and time_mask_param <= 0:
+        return image
+    image = image.clone()
+    _, h, w = image.shape
+    for _ in range(num_freq_masks):
+        if freq_mask_param > 0 and h > 1:
+            f = random.randint(0, min(freq_mask_param, h - 1))
+            f0 = random.randint(0, h - f)
+            image[:, f0 : f0 + f, :] = 0.0
+    for _ in range(num_time_masks):
+        if time_mask_param > 0 and w > 1:
+            t = random.randint(0, min(time_mask_param, w - 1))
+            t0 = random.randint(0, w - t)
+            image[:, :, t0 : t0 + t] = 0.0
+    return image
+
+
 def waveform_to_image(
     waveform: np.ndarray,
     sample_rate: int,

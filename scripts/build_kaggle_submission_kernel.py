@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -23,6 +24,17 @@ MODULE_FILES = [
 ]
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build the CPU-only Kaggle submission kernel from a staged checkpoint dataset."
+    )
+    parser.add_argument("--kernel-dir", type=Path, default=KERNEL_DIR)
+    parser.add_argument("--kernel-id", default=KERNEL_ID)
+    parser.add_argument("--title", default=KERNEL_TITLE)
+    parser.add_argument("--checkpoint-dataset", default=CHECKPOINT_DATASET)
+    return parser.parse_args()
+
+
 def build_module_payload() -> str:
     payload = {
         module_name: (SRC_DIR / module_name).read_text()
@@ -31,10 +43,15 @@ def build_module_payload() -> str:
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
-def render_metadata() -> str:
+def render_metadata(
+    *,
+    kernel_id: str,
+    title: str,
+    checkpoint_dataset: str,
+) -> str:
     payload = {
-        "id": KERNEL_ID,
-        "title": KERNEL_TITLE,
+        "id": kernel_id,
+        "title": title,
         "code_file": "run.py",
         "language": "python",
         "kernel_type": "script",
@@ -42,7 +59,7 @@ def render_metadata() -> str:
         "enable_gpu": "false",
         "enable_tpu": "false",
         "enable_internet": "false",
-        "dataset_sources": [CHECKPOINT_DATASET],
+        "dataset_sources": [checkpoint_dataset],
         "competition_sources": ["birdclef-2026"],
         "kernel_sources": [],
         "model_sources": [],
@@ -50,7 +67,7 @@ def render_metadata() -> str:
     return json.dumps(payload, indent=2)
 
 
-def render_run_file(module_payload: str) -> str:
+def render_run_file(module_payload: str, checkpoint_dataset: str) -> str:
     return f"""from __future__ import annotations
 
 import json
@@ -63,7 +80,7 @@ INFER_OUTPUT = Path("/kaggle/working/artifacts/infer")
 FINAL_SUBMISSION = Path("/kaggle/working/submission.csv")
 PACKAGE_ROOT = Path("/kaggle/working/_kernel_pkg")
 MODULE_SOURCES = json.loads(r'''{module_payload}''')
-CHECKPOINT_DATASET = "{CHECKPOINT_DATASET.split('/')[-1]}"
+CHECKPOINT_DATASET = "{checkpoint_dataset.split('/')[-1]}"
 
 
 def detect_data_root() -> Path:
@@ -129,6 +146,10 @@ def run_infer() -> Path:
         "5",
         "--batch-size",
         "8",
+        "--tta-shifts",
+        "1",
+        "--topn-postprocess",
+        "--temporal-smoothing",
     ]
     submission = infer_main()
     shutil.copy2(submission, FINAL_SUBMISSION)
@@ -142,10 +163,20 @@ if __name__ == "__main__":
 
 
 def main() -> None:
-    KERNEL_DIR.mkdir(parents=True, exist_ok=True)
-    RUN_FILE.write_text(render_run_file(build_module_payload()))
-    METADATA_FILE.write_text(render_metadata())
-    print(KERNEL_DIR)
+    args = parse_args()
+    kernel_dir = args.kernel_dir
+    run_file = kernel_dir / "run.py"
+    metadata_file = kernel_dir / "kernel-metadata.json"
+    kernel_dir.mkdir(parents=True, exist_ok=True)
+    run_file.write_text(render_run_file(build_module_payload(), args.checkpoint_dataset))
+    metadata_file.write_text(
+        render_metadata(
+            kernel_id=args.kernel_id,
+            title=args.title,
+            checkpoint_dataset=args.checkpoint_dataset,
+        )
+    )
+    print(kernel_dir)
 
 
 if __name__ == "__main__":

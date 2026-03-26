@@ -40,6 +40,18 @@ class KernelPreset:
     cpu_max_samples: int
     gpu_infer_batch_size: int
     cpu_infer_batch_size: int
+    # v6 augmentation and training improvements
+    loss: str = "focal"
+    label_smoothing: float = 0.0
+    mixup_alpha: float = 0.0
+    random_filter_prob: float = 0.0
+    freq_mask_param: int = 0
+    time_mask_param: int = 0
+    drop_path_rate: float = 0.0
+    # v6 inference improvements
+    tta_shifts: int = 0
+    topn_postprocess: bool = False
+    temporal_smoothing: bool = False
 
 
 PRESETS: dict[str, KernelPreset] = {
@@ -66,11 +78,11 @@ PRESETS: dict[str, KernelPreset] = {
     "transformer": KernelPreset(
         name="transformer",
         directory_name="birdclef_2026_transformer_gpu",
-        kernel_id="muditjain1729/birdclef-2026-convnext-rope-transformer-gpu",
-        title="BirdCLEF 2026 ConvNeXt RoPE Transformer GPU",
+        kernel_id="muditjain1729/birdclef-2026-convnext-rope-xfmr-gpu-baseline",
+        title="BirdCLEF 2026 ConvNeXt RoPE Xfmr GPU v6",
         architecture="efficientnet_transformer_sed",
         backbone="convnext_nano",
-        epochs=10,
+        epochs=25,
         image_height=128,
         image_width=256,
         transformer_dim=256,
@@ -78,10 +90,21 @@ PRESETS: dict[str, KernelPreset] = {
         transformer_layers=2,
         gpu_batch_size=12,
         cpu_batch_size=2,
-        gpu_max_samples=10000,
+        gpu_max_samples=50000,
         cpu_max_samples=1000,
         gpu_infer_batch_size=32,
         cpu_infer_batch_size=8,
+        # v6 improvements
+        loss="focal",
+        label_smoothing=0.05,
+        mixup_alpha=0.5,
+        random_filter_prob=0.5,
+        freq_mask_param=30,
+        time_mask_param=0,
+        drop_path_rate=0.1,
+        tta_shifts=1,
+        topn_postprocess=True,
+        temporal_smoothing=True,
     ),
     "htsat": KernelPreset(
         name="htsat",
@@ -329,19 +352,35 @@ def run_train() -> Path:
         "{preset.transformer_heads}",
         "--transformer-layers",
         "{preset.transformer_layers}",
+        "--transformer-pooling",
+        "attention",
         "--min-rating",
         "2",
         "--validation-fraction",
         "0.1",
         "--max-samples",
         max_samples,
+        "--loss",
+        "{preset.loss}",
+        "--label-smoothing",
+        "{preset.label_smoothing}",
+        "--mixup-alpha",
+        "{preset.mixup_alpha}",
+        "--random-filter-prob",
+        "{preset.random_filter_prob}",
+        "--freq-mask-param",
+        "{preset.freq_mask_param}",
+        "--time-mask-param",
+        "{preset.time_mask_param}",
+        "--drop-path-rate",
+        "{preset.drop_path_rate}",
         "--no-pretrained",
     ]
     return train_main()
 
 
 def run_infer(checkpoint: Path) -> Path:
-    sys.argv = [
+    argv = [
         "birdclef-infer",
         "--data-root",
         str(DATA_ROOT),
@@ -353,7 +392,12 @@ def run_infer(checkpoint: Path) -> Path:
         "5",
         "--batch-size",
         "{preset.gpu_infer_batch_size}" if USE_CUDA else "{preset.cpu_infer_batch_size}",
+        "--tta-shifts",
+        "{preset.tta_shifts}",
     ]
+    {"argv.append('--topn-postprocess')" if preset.topn_postprocess else ""}
+    {"argv.append('--temporal-smoothing')" if preset.temporal_smoothing else ""}
+    sys.argv = argv
     submission = infer_main()
     shutil.copy2(submission, FINAL_SUBMISSION)
     return FINAL_SUBMISSION

@@ -29,6 +29,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transformer-dim", type=int, default=128)
     parser.add_argument("--transformer-heads", type=int, default=4)
     parser.add_argument("--transformer-layers", type=int, default=1)
+    parser.add_argument(
+        "--transformer-pooling",
+        choices=["clip_attention", "attention", "mean", "max"],
+        default="attention",
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.25)
     parser.add_argument("--force-download", action="store_true")
     return parser.parse_args()
@@ -121,6 +126,8 @@ def main() -> Path:
         str(args.transformer_heads),
         "--transformer-layers",
         str(args.transformer_layers),
+        "--transformer-pooling",
+        args.transformer_pooling,
         "--max-samples",
         str(len(files)),
         "--no-pretrained",

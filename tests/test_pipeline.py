@@ -11,8 +11,14 @@ import pandas as pd
 import soundfile as sf
 import torch
 
+from birdclef2026.data import Example
 from birdclef2026.kaggle_api import parse_kernel_status
 from birdclef2026.model import build_model
+from birdclef2026.train import (
+    compute_class_focal_alpha,
+    compute_label_counts,
+    normalized_inverse_frequency_weights,
+)
 
 
 def create_tone(
@@ -109,7 +115,28 @@ def test_smoke_train_and_infer(tmp_path: Path) -> None:
     assert checkpoint_path.exists()
     history = json.loads((output_dir / "train" / "history.json").read_text())
     assert history
-    assert {"valid_accuracy", "valid_precision", "valid_recall", "valid_f1"} <= history[0].keys()
+    assert {
+        "valid_accuracy",
+        "valid_precision",
+        "valid_recall",
+        "valid_f1",
+        "valid_precision_micro",
+        "valid_recall_micro",
+        "valid_f1_micro",
+    } <= history[0].keys()
+    class_alpha = json.loads((output_dir / "train" / "class_alpha.json").read_text())
+    assert class_alpha
+    assert {
+        "label",
+        "primary_count",
+        "secondary_count",
+        "combined_count",
+        "primary_weight",
+        "secondary_alpha",
+        "combined_alpha",
+    } <= class_alpha[0].keys()
+    thresholds = json.loads((output_dir / "train" / "validation_thresholds.json").read_text())
+    assert thresholds["thresholds"]
 
     infer_result = run_module(
         [
@@ -141,6 +168,13 @@ def test_build_model_variants() -> None:
         backbone="convnext_atto",
         pretrained=False,
     )
+    classifier_dual = build_model(
+        num_classes=3,
+        architecture="efficientnet_classifier",
+        backbone="convnext_atto",
+        classifier_head_mode="dual",
+        pretrained=False,
+    )
     transformer = build_model(
         num_classes=3,
         architecture="efficientnet_transformer_sed",
@@ -149,6 +183,40 @@ def test_build_model_variants() -> None:
         transformer_dim=128,
         transformer_heads=4,
         transformer_layers=1,
+        transformer_pooling="attention",
+        dropout=0.1,
+    )
+    transformer_mean = build_model(
+        num_classes=3,
+        architecture="efficientnet_transformer_sed",
+        backbone="convnext_atto",
+        pretrained=False,
+        transformer_dim=128,
+        transformer_heads=4,
+        transformer_layers=1,
+        transformer_pooling="mean",
+        dropout=0.1,
+    )
+    transformer_max = build_model(
+        num_classes=3,
+        architecture="efficientnet_transformer_sed",
+        backbone="convnext_atto",
+        pretrained=False,
+        transformer_dim=128,
+        transformer_heads=4,
+        transformer_layers=1,
+        transformer_pooling="max",
+        dropout=0.1,
+    )
+    transformer_legacy = build_model(
+        num_classes=3,
+        architecture="efficientnet_transformer_sed",
+        backbone="convnext_atto",
+        pretrained=False,
+        transformer_dim=128,
+        transformer_heads=4,
+        transformer_layers=1,
+        transformer_pooling="clip_attention",
         dropout=0.1,
     )
     htsat = build_model(
@@ -163,7 +231,14 @@ def test_build_model_variants() -> None:
     )
 
     assert classifier(inputs).shape == (2, 3)
+    dual_outputs = classifier_dual(inputs)
+    assert set(dual_outputs) == {"primary_logits", "secondary_logits"}
+    assert dual_outputs["primary_logits"].shape == (2, 3)
+    assert dual_outputs["secondary_logits"].shape == (2, 3)
     assert transformer(inputs).shape == (2, 3)
+    assert transformer_mean(inputs).shape == (2, 3)
+    assert transformer_max(inputs).shape == (2, 3)
+    assert transformer_legacy(inputs).shape == (2, 3)
     assert htsat(htsat_inputs).shape == (2, 3)
 
 
@@ -172,3 +247,21 @@ def test_parse_kernel_status() -> None:
         'muditjain1729/birdclef-2026-eb0-gpu-baseline has status "KernelWorkerStatus.RUNNING"'
     )
     assert status == "KernelWorkerStatus.RUNNING"
+
+
+def test_compute_class_focal_alpha_weights_rare_classes_more() -> None:
+    examples = [
+        Example(audio_path=Path("common_0.ogg"), labels=["common"], primary_label="common"),
+        Example(audio_path=Path("common_1.ogg"), labels=["common"], primary_label="common"),
+        Example(
+            audio_path=Path("mixed.ogg"),
+            labels=["common", "rare"],
+            primary_label="rare",
+        ),
+    ]
+    counts = compute_label_counts(examples, ["rare", "common"], mode="combined")
+    weights = normalized_inverse_frequency_weights(counts)
+    alpha = compute_class_focal_alpha(counts, alpha_min=0.05, alpha_max=0.95)
+    assert 0.05 <= float(alpha.min()) <= float(alpha.max()) <= 0.95
+    assert weights[0] > weights[1]
+    assert alpha[0] > alpha[1]
