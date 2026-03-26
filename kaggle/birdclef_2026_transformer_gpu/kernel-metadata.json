@@ -1,5 +1,5 @@
 {
-  "id": "muditjain1729/birdclef-2026-convnext-rope-xfmr-gpu-baseline",
+  "id": "muditjain1729/birdclef-2026-convnext-rope-xfmr-gpu-v6",
   "title": "BirdCLEF 2026 ConvNeXt RoPE Xfmr GPU v6",
   "code_file": "run.py",
   "language": "python",

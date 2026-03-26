@@ -78,7 +78,7 @@ PRESETS: dict[str, KernelPreset] = {
     "transformer": KernelPreset(
         name="transformer",
         directory_name="birdclef_2026_transformer_gpu",
-        kernel_id="muditjain1729/birdclef-2026-convnext-rope-xfmr-gpu-baseline",
+        kernel_id="muditjain1729/birdclef-2026-convnext-rope-xfmr-gpu-v6",
         title="BirdCLEF 2026 ConvNeXt RoPE Xfmr GPU v6",
         architecture="efficientnet_transformer_sed",
         backbone="convnext_nano",
