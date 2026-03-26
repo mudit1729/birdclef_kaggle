@@ -1,0 +1,15 @@
+.DS_Store
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+artifacts/
+data/
+external/
+kaggle/birdclef_2026_checkpoint_dataset/
+*.ipynb
+*.csv
+*.zip
+*.pt
+*.pth
