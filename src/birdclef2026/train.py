@@ -155,7 +155,11 @@ def cuda_device_supported() -> bool:
         except Exception:
             supported_arches = []
         if supported_arches:
-            return arch in supported_arches
+            if arch in supported_arches:
+                return True
+            # Check forward compatibility: sm_89 is supported by sm_90
+            supported_majors = {int(a.split("_")[1][0]) for a in supported_arches if a.startswith("sm_")}
+            return major in supported_majors
     return major >= 7
 
 
