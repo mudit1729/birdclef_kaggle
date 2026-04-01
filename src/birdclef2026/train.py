@@ -14,6 +14,11 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
+
 from birdclef2026.config import ARTIFACTS_ROOT, COMPETITION_ROOT
 from birdclef2026.data import BirdClefDataset, Example, load_examples, load_layout, split_examples
 from birdclef2026.kaggle_api import DEFAULT_COMPETITION, ensure_competition_data
@@ -752,6 +757,13 @@ def main() -> Path:
         )
     )
 
+    tb_writer = None
+    if SummaryWriter is not None:
+        tb_log_dir = output_dir / "tb_logs"
+        tb_log_dir.mkdir(parents=True, exist_ok=True)
+        tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
+        print(f"TensorBoard logging to: {tb_log_dir}")
+
     best_score = float("-inf")
     history: list[dict[str, float]] = []
     best_path = output_dir / "best_model.pt"
@@ -786,6 +798,18 @@ def main() -> Path:
             **fixed_metrics,
         }
         history.append(metrics)
+        if tb_writer is not None:
+            tb_writer.add_scalar("Loss/train", train_loss, epoch)
+            tb_writer.add_scalar("Loss/valid", valid_loss, epoch)
+            tb_writer.add_scalar("Metrics/mAP", valid_map, epoch)
+            tb_writer.add_scalar("Metrics/accuracy", metrics["valid_accuracy"], epoch)
+            tb_writer.add_scalar("Metrics/precision_macro", metrics["valid_precision"], epoch)
+            tb_writer.add_scalar("Metrics/recall_macro", metrics["valid_recall"], epoch)
+            tb_writer.add_scalar("Metrics/f1_macro", metrics["valid_f1"], epoch)
+            tb_writer.add_scalar("Metrics/f1_micro", metrics["valid_f1_micro"], epoch)
+            current_lr = optimizer.param_groups[-1]["lr"]
+            tb_writer.add_scalar("LR", current_lr, epoch)
+            tb_writer.flush()
         print(
             " ".join(
                 [
@@ -837,6 +861,8 @@ def main() -> Path:
             )
 
     (output_dir / "history.json").write_text(json.dumps(history, indent=2))
+    if tb_writer is not None:
+        tb_writer.close()
     return best_path
 
 
