@@ -140,13 +140,97 @@ class FramewiseAttentionPooling(nn.Module):
         return pooled, weights
 
 
+class SEDAttentionHead(nn.Module):
+    """Sound Event Detection head with parallel attention + max pooling.
+
+    Pools features first, then classifies — avoids noisy frame-level logit aggregation.
+    Uses the dual-pooling strategy from PANNs / top BirdCLEF solutions.
+    """
+
+    def __init__(self, dim: int, num_classes: int, dropout: float) -> None:
+        super().__init__()
+        self.fc = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        self.att_fc = nn.Linear(dim, num_classes)
+        self.cls_fc = nn.Linear(dim, num_classes)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        # tokens: (B, T, D)
+        x = self.dropout(torch.relu(self.fc(tokens)))
+        # Per-class attention weights across frames
+        att_weights = torch.softmax(self.att_fc(x), dim=1)  # (B, T, C)
+        # Frame-level class logits
+        frame_logits = self.cls_fc(x)  # (B, T, C)
+        # Clip-level: attention-weighted sum + max-pool, averaged
+        clip_att = (frame_logits * att_weights).sum(dim=1)  # (B, C)
+        clip_max = frame_logits.max(dim=1).values  # (B, C)
+        return (clip_att + clip_max) / 2.0
+
+
 def combine_primary_secondary_probabilities(
     primary_logits: torch.Tensor,
     secondary_logits: torch.Tensor,
 ) -> torch.Tensor:
+    # Cast to float32 for numerical stability (inputs may be float16 from AMP)
+    primary_logits = primary_logits.float()
+    secondary_logits = secondary_logits.float()
     primary_probs = torch.softmax(primary_logits, dim=-1)
     secondary_probs = torch.sigmoid(secondary_logits)
-    return 1.0 - (1.0 - primary_probs) * (1.0 - secondary_probs)
+    combined = 1.0 - (1.0 - primary_probs) * (1.0 - secondary_probs)
+    return torch.clamp(combined, 0.0, 1.0)
+
+
+class GeMPooling(nn.Module):
+    """Generalized Mean Pooling (GeM).
+
+    Learnable pooling between average (p=1) and max (p→∞).
+    Used by top BirdCLEF solutions (2024 2nd place, 2025 top-2%).
+    """
+
+    def __init__(self, p: float = 3.0, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.p = nn.Parameter(torch.tensor(p))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        return (
+            x.clamp(min=self.eps).pow(self.p).mean(dim=dim).pow(1.0 / self.p)
+        )
+
+
+class MultiScaleFeatureFusion(nn.Module):
+    """Fuse features from multiple backbone stages.
+
+    Extracts from last two stages, upsamples the deeper one if needed,
+    and concatenates along the channel dimension before projecting down.
+    This captures both fine-grained spectral texture (earlier stage) and
+    high-level semantic features (later stage).
+    """
+
+    def __init__(self, channels_list: list[int], output_dim: int) -> None:
+        super().__init__()
+        total_channels = sum(channels_list)
+        self.projection = nn.Sequential(
+            nn.Linear(total_channels, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, feature_maps: list[torch.Tensor]) -> torch.Tensor:
+        # Each feature map: (B, C_i, H_i, W_i) — make channel-first
+        processed = []
+        target_h = feature_maps[-1].shape[2]
+        target_w = feature_maps[-1].shape[3]
+        for fm in feature_maps:
+            fm = to_channel_first(fm)
+            if fm.shape[2] != target_h or fm.shape[3] != target_w:
+                fm = nn.functional.adaptive_avg_pool2d(fm, (target_h, target_w))
+            processed.append(fm)
+        # Concatenate along channel dim: (B, sum(C_i), H, W)
+        fused = torch.cat(processed, dim=1)
+        # Collapse frequency, keep time: (B, sum(C_i), W)
+        fused = fused.mean(dim=2).transpose(1, 2)  # (B, W, sum(C_i))
+        return self.projection(fused)  # (B, W, output_dim)
 
 
 def to_channel_first(feature_map: torch.Tensor) -> torch.Tensor:
@@ -242,18 +326,42 @@ class BirdClefTransformerSEDModel(nn.Module):
         dropout: float,
         transformer_pooling: str,
         drop_path_rate: float = 0.0,
+        multi_scale: bool = False,
+        gem_pooling: bool = False,
     ) -> None:
         super().__init__()
-        self.backbone = timm.create_model(
-            backbone,
-            pretrained=pretrained,
-            in_chans=1,
-            features_only=True,
-            out_indices=(-1,),
-            drop_path_rate=drop_path_rate,
-        )
-        feature_channels = self.backbone.feature_info.channels()[-1]
-        self.token_projection = nn.Linear(feature_channels, transformer_dim)
+        self.multi_scale = multi_scale
+        self.gem_pooling = gem_pooling
+
+        if multi_scale:
+            self.backbone = timm.create_model(
+                backbone,
+                pretrained=pretrained,
+                in_chans=1,
+                features_only=True,
+                out_indices=(-2, -1),
+                drop_path_rate=drop_path_rate,
+            )
+            channels_list = self.backbone.feature_info.channels()[-2:]
+            self.feature_fusion = MultiScaleFeatureFusion(
+                channels_list=channels_list,
+                output_dim=transformer_dim,
+            )
+        else:
+            self.backbone = timm.create_model(
+                backbone,
+                pretrained=pretrained,
+                in_chans=1,
+                features_only=True,
+                out_indices=(-1,),
+                drop_path_rate=drop_path_rate,
+            )
+            feature_channels = self.backbone.feature_info.channels()[-1]
+            self.token_projection = nn.Linear(feature_channels, transformer_dim)
+
+        if gem_pooling:
+            self.gem = GeMPooling(p=3.0)
+
         self.sequence_encoder = nn.ModuleList(
             RotaryTransformerBlock(
                 dim=transformer_dim,
@@ -264,7 +372,13 @@ class BirdClefTransformerSEDModel(nn.Module):
         )
         self.transformer_pooling = transformer_pooling
         self.output_norm = nn.LayerNorm(transformer_dim)
-        if transformer_pooling == "clip_attention":
+        if transformer_pooling == "sed_attention":
+            self.sed_head = SEDAttentionHead(
+                dim=transformer_dim,
+                num_classes=num_classes,
+                dropout=dropout,
+            )
+        elif transformer_pooling == "clip_attention":
             self.attention_pool = AttentionPooling(transformer_dim, dropout=dropout)
             self.classifier = nn.Linear(transformer_dim, num_classes)
         else:
@@ -279,13 +393,24 @@ class BirdClefTransformerSEDModel(nn.Module):
                 raise ValueError(f"Unknown transformer pooling mode: {transformer_pooling}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feature_map = to_channel_first(self.backbone(x)[-1])
-        # Collapse the frequency axis and keep the time axis as tokens.
-        tokens = feature_map.mean(dim=2).transpose(1, 2)
-        tokens = self.token_projection(tokens)
+        if self.multi_scale:
+            feature_maps = self.backbone(x)[-2:]
+            tokens = self.feature_fusion(feature_maps)
+        else:
+            feature_map = to_channel_first(self.backbone(x)[-1])
+            # Collapse the frequency axis and keep the time axis as tokens.
+            if self.gem_pooling:
+                # GeM pool over frequency (dim=2): (B, C, H, W) -> (B, C, W)
+                tokens = self.gem(feature_map, dim=2).transpose(1, 2)
+            else:
+                tokens = feature_map.mean(dim=2).transpose(1, 2)
+            tokens = self.token_projection(tokens)
+
         for block in self.sequence_encoder:
             tokens = block(tokens)
         tokens = self.output_norm(tokens)
+        if self.transformer_pooling == "sed_attention":
+            return self.sed_head(tokens)
         if self.transformer_pooling == "clip_attention":
             pooled, _ = self.attention_pool(tokens)
             return self.classifier(pooled)
@@ -360,6 +485,8 @@ def build_model(
     dropout: float = 0.1,
     transformer_pooling: str = "clip_attention",
     drop_path_rate: float = 0.0,
+    multi_scale: bool = False,
+    gem_pooling: bool = False,
 ) -> nn.Module:
     if architecture == "efficientnet_classifier":
         if classifier_head_mode == "dual":
@@ -388,6 +515,8 @@ def build_model(
             dropout=dropout,
             transformer_pooling=transformer_pooling,
             drop_path_rate=drop_path_rate,
+            multi_scale=multi_scale,
+            gem_pooling=gem_pooling,
         )
     if architecture == "htsat_token_semantic":
         return BirdClefHTSATModel(

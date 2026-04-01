@@ -241,8 +241,9 @@ class BirdClefDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
             lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
             waveform = (lam * waveform + (1.0 - lam) * mix_waveform).astype(np.float32)
             mix_targets = self._build_targets(mix_example)
-            targets["combined"] = torch.maximum(targets["combined"], mix_targets["combined"])
-            targets["secondary"] = torch.maximum(targets["secondary"], mix_targets["secondary"])
+            # Soft-blend targets proportional to mixing ratio (not hard OR)
+            targets["combined"] = lam * targets["combined"] + (1.0 - lam) * mix_targets["combined"]
+            targets["secondary"] = lam * targets["secondary"] + (1.0 - lam) * mix_targets["secondary"]
 
         # Random filtering augmentation (microphone variation simulation)
         if self.random_filter_prob > 0 and self.random_crop:

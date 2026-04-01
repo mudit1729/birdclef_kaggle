@@ -47,6 +47,8 @@ class TrainConfig:
     batch_size: int
     epochs: int
     lr: float
+    backbone_lr_factor: float
+    warmup_epochs: int
     weight_decay: float
     primary_loss_weight: float
     secondary_loss_weight: float
@@ -64,6 +66,8 @@ class TrainConfig:
     num_workers: int
     min_rating: float
     max_samples: int | None
+    multi_scale: bool
+    gem_pooling: bool
     download_if_missing: bool
 
 
@@ -101,14 +105,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument(
         "--transformer-pooling",
-        choices=["clip_attention", "attention", "mean", "max"],
+        choices=["clip_attention", "attention", "sed_attention", "mean", "max"],
         default="attention",
     )
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--drop-path-rate", type=float, default=0.0)
+    parser.add_argument("--multi-scale", action="store_true", default=False,
+                        help="Use multi-scale backbone features (last 2 stages)")
+    parser.add_argument("--gem-pooling", action="store_true", default=False,
+                        help="Use GeM pooling over frequency axis (learnable avg/max blend)")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--backbone-lr-factor", type=float, default=1.0)
+    parser.add_argument("--warmup-epochs", type=int, default=0)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--primary-loss-weight", type=float, default=2.0)
     parser.add_argument("--secondary-loss-weight", type=float, default=1.0)
@@ -172,6 +182,8 @@ def backbone_input_size_hint(backbone: str) -> int | None:
 
 
 def macro_average_precision(targets: np.ndarray, probabilities: np.ndarray) -> float:
+    # Replace NaN/inf values with 0 to prevent sklearn errors
+    probabilities = np.nan_to_num(probabilities, nan=0.0, posinf=1.0, neginf=0.0)
     scores: list[float] = []
     for index in range(targets.shape[1]):
         if targets[:, index].sum() == 0:
@@ -366,11 +378,14 @@ class DualHeadClassifierCriterion(nn.Module):
 
 def output_probabilities(outputs: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
     if isinstance(outputs, dict):
-        return combine_primary_secondary_probabilities(
+        probs = combine_primary_secondary_probabilities(
             outputs["primary_logits"],
             outputs["secondary_logits"],
         )
-    return torch.sigmoid(outputs)
+    else:
+        probs = torch.sigmoid(outputs.float())
+    # Replace any NaN/inf that slipped through
+    return torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
 
 
 def sweep_per_class_thresholds(
@@ -462,10 +477,13 @@ def run_epoch(
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
         losses.append(float(loss.item()))
         targets_all.append(raw_targets["combined"].detach().cpu().numpy())
@@ -556,12 +574,31 @@ def main() -> Path:
         transformer_pooling=args.transformer_pooling,
         dropout=args.dropout,
         drop_path_rate=args.drop_path_rate,
+        multi_scale=args.multi_scale,
+        gem_pooling=args.gem_pooling,
     ).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    # Differential learning rates: lower LR for pretrained backbone
+    if args.backbone_lr_factor < 1.0 and hasattr(model, "backbone"):
+        backbone_params = list(model.backbone.parameters())
+        backbone_ids = {id(p) for p in backbone_params}
+        head_params = [p for p in model.parameters() if id(p) not in backbone_ids]
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": backbone_params, "lr": args.lr * args.backbone_lr_factor},
+                {"params": head_params, "lr": args.lr},
+            ],
+            weight_decay=args.weight_decay,
+        )
+        print(
+            f"Differential LR: backbone={args.lr * args.backbone_lr_factor:.2e}, "
+            f"head={args.lr:.2e} ({len(backbone_params)} backbone, {len(head_params)} head params)"
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
     combined_counts = compute_label_counts(train_examples, label_names, mode="combined")
     primary_counts = compute_label_counts(train_examples, label_names, mode="primary")
     secondary_counts = compute_label_counts(train_examples, label_names, mode="secondary")
@@ -601,9 +638,23 @@ def main() -> Path:
     else:
         criterion = MultilabelCriterion(single_head_loss).to(device)
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
-    )
+    if args.warmup_epochs > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, total_iters=args.warmup_epochs
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=args.lr * 0.01
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[args.warmup_epochs],
+        )
+        print(f"LR schedule: {args.warmup_epochs}-epoch warmup + cosine annealing")
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
+        )
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -633,6 +684,8 @@ def main() -> Path:
         batch_size=args.batch_size,
         epochs=args.epochs,
         lr=args.lr,
+        backbone_lr_factor=args.backbone_lr_factor,
+        warmup_epochs=args.warmup_epochs,
         weight_decay=args.weight_decay,
         primary_loss_weight=args.primary_loss_weight,
         secondary_loss_weight=args.secondary_loss_weight,
@@ -650,6 +703,8 @@ def main() -> Path:
         num_workers=args.num_workers,
         min_rating=args.min_rating,
         max_samples=args.max_samples,
+        multi_scale=args.multi_scale,
+        gem_pooling=args.gem_pooling,
         download_if_missing=args.download_if_missing,
     )
     weighting_payload = [

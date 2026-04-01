@@ -48,6 +48,17 @@ class KernelPreset:
     freq_mask_param: int = 0
     time_mask_param: int = 0
     drop_path_rate: float = 0.0
+    # v7 architecture improvements
+    dropout: float = 0.1
+    backbone_lr_factor: float = 1.0
+    warmup_epochs: int = 0
+    transformer_pooling: str = "attention"
+    lr: float = 1e-3
+    focal_alpha_min: float = 0.05
+    focal_alpha_max: float = 0.95
+    # v10 backbone improvements
+    multi_scale: bool = False
+    gem_pooling: bool = False
     # v6 inference improvements
     tta_shifts: int = 0
     topn_postprocess: bool = False
@@ -81,7 +92,7 @@ PRESETS: dict[str, KernelPreset] = {
         kernel_id="muditjain1729/birdclef-2026-convnext-rope-xfmr-gpu-v6",
         title="BirdCLEF 2026 ConvNeXt RoPE Xfmr GPU v6",
         architecture="efficientnet_transformer_sed",
-        backbone="convnext_nano",
+        backbone="eca_nfnet_l0",
         epochs=25,
         image_height=128,
         image_width=256,
@@ -92,16 +103,104 @@ PRESETS: dict[str, KernelPreset] = {
         cpu_batch_size=2,
         gpu_max_samples=50000,
         cpu_max_samples=1000,
-        gpu_infer_batch_size=32,
+        gpu_infer_batch_size=24,
         cpu_infer_batch_size=8,
-        # v6 improvements
+        # v7 architecture improvements
         loss="focal",
-        label_smoothing=0.05,
-        mixup_alpha=0.5,
-        random_filter_prob=0.5,
-        freq_mask_param=30,
+        label_smoothing=0.0,
+        mixup_alpha=0.2,
+        random_filter_prob=0.3,
+        freq_mask_param=20,
         time_mask_param=0,
-        drop_path_rate=0.1,
+        drop_path_rate=0.15,
+        dropout=0.3,
+        backbone_lr_factor=0.1,
+        warmup_epochs=3,
+        transformer_pooling="sed_attention",
+        lr=5e-4,
+        focal_alpha_min=0.15,
+        focal_alpha_max=0.85,
+        # v10 backbone improvements
+        multi_scale=True,
+        gem_pooling=False,
+        tta_shifts=1,
+        topn_postprocess=True,
+        temporal_smoothing=True,
+    ),
+    "convnext_tiny": KernelPreset(
+        name="convnext_tiny",
+        directory_name="birdclef_2026_convnext_tiny_gpu",
+        kernel_id="muditjain1729/birdclef-2026-convnext-tiny-gpu",
+        title="BirdCLEF 2026 ConvNeXt Tiny GPU",
+        architecture="efficientnet_transformer_sed",
+        backbone="convnext_tiny",
+        epochs=25,
+        image_height=128,
+        image_width=256,
+        transformer_dim=256,
+        transformer_heads=8,
+        transformer_layers=2,
+        gpu_batch_size=10,
+        cpu_batch_size=2,
+        gpu_max_samples=50000,
+        cpu_max_samples=1000,
+        gpu_infer_batch_size=16,
+        cpu_infer_batch_size=8,
+        loss="focal",
+        label_smoothing=0.0,
+        mixup_alpha=0.2,
+        random_filter_prob=0.3,
+        freq_mask_param=20,
+        time_mask_param=0,
+        drop_path_rate=0.15,
+        dropout=0.3,
+        backbone_lr_factor=0.1,
+        warmup_epochs=3,
+        transformer_pooling="sed_attention",
+        lr=5e-4,
+        focal_alpha_min=0.15,
+        focal_alpha_max=0.85,
+        multi_scale=False,
+        gem_pooling=False,
+        tta_shifts=1,
+        topn_postprocess=True,
+        temporal_smoothing=True,
+    ),
+    "efficientnet_b5": KernelPreset(
+        name="efficientnet_b5",
+        directory_name="birdclef_2026_effnet_b5_gpu",
+        kernel_id="muditjain1729/birdclef-2026-effnet-b5-gpu",
+        title="BirdCLEF 2026 EfficientNet B5 GPU",
+        architecture="efficientnet_transformer_sed",
+        backbone="tf_efficientnet_b5",
+        epochs=25,
+        image_height=128,
+        image_width=256,
+        transformer_dim=256,
+        transformer_heads=8,
+        transformer_layers=2,
+        gpu_batch_size=10,
+        cpu_batch_size=2,
+        gpu_max_samples=50000,
+        cpu_max_samples=1000,
+        gpu_infer_batch_size=16,
+        cpu_infer_batch_size=8,
+        loss="focal",
+        label_smoothing=0.0,
+        mixup_alpha=0.2,
+        random_filter_prob=0.3,
+        freq_mask_param=20,
+        time_mask_param=0,
+        drop_path_rate=0.15,
+        dropout=0.3,
+        backbone_lr_factor=0.1,
+        warmup_epochs=3,
+        transformer_pooling="sed_attention",
+        lr=5e-4,
+        focal_alpha_min=0.15,
+        focal_alpha_max=0.85,
+        multi_scale=False,
+        gem_pooling=False,
         tta_shifts=1,
         topn_postprocess=True,
         temporal_smoothing=True,
@@ -146,6 +245,18 @@ def build_module_payload() -> str:
         for module_name in MODULE_FILES
     }
     return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _render_train_bool_flags(preset: KernelPreset) -> str:
+    """Render boolean CLI flags for the training argv list."""
+    lines = []
+    if preset.multi_scale:
+        lines.append('    sys.argv.append("--multi-scale")')
+    if preset.gem_pooling:
+        lines.append('    sys.argv.append("--gem-pooling")')
+    if lines:
+        return "\n".join(lines) + "\n"
+    return ""
 
 
 def render_run_file(module_payload: str, preset: KernelPreset) -> str:
@@ -353,7 +464,7 @@ def run_train() -> Path:
         "--transformer-layers",
         "{preset.transformer_layers}",
         "--transformer-pooling",
-        "attention",
+        "{preset.transformer_pooling}",
         "--min-rating",
         "0",
         "--validation-fraction",
@@ -374,9 +485,21 @@ def run_train() -> Path:
         "{preset.time_mask_param}",
         "--drop-path-rate",
         "{preset.drop_path_rate}",
+        "--dropout",
+        "{preset.dropout}",
+        "--lr",
+        "{preset.lr}",
+        "--backbone-lr-factor",
+        "{preset.backbone_lr_factor}",
+        "--warmup-epochs",
+        "{preset.warmup_epochs}",
+        "--focal-alpha-min",
+        "{preset.focal_alpha_min}",
+        "--focal-alpha-max",
+        "{preset.focal_alpha_max}",
         "--pretrained",
     ]
-    return train_main()
+{_render_train_bool_flags(preset)}    return train_main()
 
 
 def run_infer(checkpoint: Path) -> Path:

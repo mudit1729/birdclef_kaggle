@@ -143,6 +143,8 @@ def main() -> Path:
         transformer_layers=int(config.get("transformer_layers", 2)),
         transformer_pooling=config.get("transformer_pooling", "clip_attention"),
         dropout=float(config.get("dropout", 0.1)),
+        multi_scale=bool(config.get("multi_scale", False)),
+        gem_pooling=bool(config.get("gem_pooling", False)),
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
