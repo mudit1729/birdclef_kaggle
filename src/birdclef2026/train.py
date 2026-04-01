@@ -641,7 +641,10 @@ def main() -> Path:
         ).to(device)
     else:
         criterion = MultilabelCriterion(single_head_loss).to(device)
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    if device.type == "cuda":
+        scaler = torch.cuda.amp.GradScaler() if hasattr(torch.cuda.amp, "GradScaler") else torch.amp.GradScaler("cuda")
+    else:
+        scaler = None
     if args.warmup_epochs > 0:
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer, start_factor=0.01, total_iters=args.warmup_epochs
